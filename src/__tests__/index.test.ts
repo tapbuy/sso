@@ -1,4 +1,4 @@
-import { createSSOHandler, SSOConfig, SSOCookieConfig } from '../index';
+import { createSSOHandler, SSOConfig, SSOCookiePayloadItem } from '../index';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -29,6 +29,89 @@ function getCookies(response: Response): string[] {
 }
 
 // ---------------------------------------------------------------------------
+// Encryption helper
+// ---------------------------------------------------------------------------
+
+const TEST_ENCRYPTION_KEY = 'test-encryption-key-for-sso-123';
+
+/**
+ * Encrypt a payload using AES-256-GCM (mirrors PHP encodeCartKey format).
+ * Result: base64( iv[12] + tag[16] + cipherText )
+ */
+async function encryptPayload(
+  payload: SSOCookiePayloadItem[],
+  key: string,
+): Promise<string> {
+  const keyBytes = new Uint8Array(32);
+  const encoder = new TextEncoder();
+  const rawKey = encoder.encode(key);
+  keyBytes.set(rawKey.subarray(0, 32));
+
+  const cryptoKey = await globalThis.crypto.subtle.importKey(
+    'raw',
+    keyBytes,
+    { name: 'AES-GCM' },
+    false,
+    ['encrypt'],
+  );
+
+  const iv = globalThis.crypto.getRandomValues(new Uint8Array(12));
+  const plaintext = encoder.encode(JSON.stringify(payload));
+
+  const encrypted = await globalThis.crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv, tagLength: 128 },
+    cryptoKey,
+    plaintext,
+  );
+
+  const encryptedBytes = new Uint8Array(encrypted);
+  const cipherText = encryptedBytes.slice(0, encryptedBytes.length - 16);
+  const tag = encryptedBytes.slice(encryptedBytes.length - 16);
+
+  // PHP format: iv + tag + cipherText
+  const result = new Uint8Array(iv.length + tag.length + cipherText.length);
+  result.set(iv, 0);
+  result.set(tag, 12);
+  result.set(cipherText, 28);
+
+  let binary = '';
+  for (let i = 0; i < result.length; i++) {
+    binary += String.fromCharCode(result[i]);
+  }
+  return btoa(binary);
+}
+
+/**
+ * Encrypt a payload using AES-256-ECB (mirrors PHP phpseclib AES ECB format).
+ * Result: base64( AES-256-ECB-PKCS7(json) )
+ */
+async function encryptPayloadECB(
+  payload: SSOCookiePayloadItem[],
+  key: string,
+): Promise<string> {
+  const nodeCrypto = await import('crypto');
+  const keyBytes = new Uint8Array(32);
+  const encoder = new TextEncoder();
+  const rawKey = encoder.encode(key);
+  keyBytes.set(rawKey.subarray(0, 32));
+
+  const plaintext = encoder.encode(JSON.stringify(payload));
+  const cipher = nodeCrypto.createCipheriv('aes-256-ecb', keyBytes, null);
+  const part1: Uint8Array = cipher.update(plaintext);
+  const part2: Uint8Array = cipher.final();
+
+  const result = new Uint8Array(part1.length + part2.length);
+  result.set(part1);
+  result.set(part2, part1.length);
+
+  let binary = '';
+  for (let i = 0; i < result.length; i++) {
+    binary += String.fromCharCode(result[i]);
+  }
+  return btoa(binary);
+}
+
+// ---------------------------------------------------------------------------
 // Config fixtures
 // ---------------------------------------------------------------------------
 
@@ -40,6 +123,7 @@ const multiCookieConfig: SSOConfig = {
     ],
     logout: ['userId', 'sessionExpiration'],
   },
+  encryptionKey: TEST_ENCRYPTION_KEY,
 };
 
 const minimalConfig: SSOConfig = {
@@ -47,6 +131,7 @@ const minimalConfig: SSOConfig = {
     login: [{ name: 'token' }],
     logout: ['token'],
   },
+  encryptionKey: TEST_ENCRYPTION_KEY,
 };
 
 // ---------------------------------------------------------------------------
@@ -55,9 +140,14 @@ const minimalConfig: SSOConfig = {
 
 describe('createSSOHandler', () => {
   describe('login action', () => {
-    it('sets all configured cookies with the token value', async () => {
+    it('sets all configured cookies from encrypted payload', async () => {
+      const payload: SSOCookiePayloadItem[] = [
+        { name: 'userId', value: 'abc123', action: 'set' },
+        { name: 'sessionExpiration', value: '2026-03-10T12:00:00.000Z', action: 'set' },
+      ];
+      const token = await encryptPayload(payload, TEST_ENCRYPTION_KEY);
       const { GET } = createSSOHandler(multiCookieConfig);
-      const res = await GET(makeRequest({ action: 'login', token: 'abc123' }));
+      const res = await GET(makeRequest({ action: 'login', token }));
 
       expect(res.status).toBe(200);
       expect(res.headers.get('Content-Type')).toBe('image/gif');
@@ -73,16 +163,21 @@ describe('createSSOHandler', () => {
       expect(cookies[0]).toContain('Secure');
       expect(cookies[0]).toContain('SameSite=Lax');
 
-      // sessionExpiration cookie
-      expect(cookies[1]).toContain('sessionExpiration=abc123');
+      // sessionExpiration cookie (not HttpOnly)
+      expect(cookies[1]).toContain('sessionExpiration=');
+      expect(cookies[1]).toContain('2026-03-10');
       expect(cookies[1]).toContain('Path=/');
       expect(cookies[1]).toContain('Max-Age=3600');
       expect(cookies[1]).not.toContain('HttpOnly');
     });
 
     it('applies default cookie options when not specified', async () => {
+      const payload: SSOCookiePayloadItem[] = [
+        { name: 'token', value: 'xyz', action: 'set' },
+      ];
+      const token = await encryptPayload(payload, TEST_ENCRYPTION_KEY);
       const { GET } = createSSOHandler(minimalConfig);
-      const res = await GET(makeRequest({ action: 'login', token: 'xyz' }));
+      const res = await GET(makeRequest({ action: 'login', token }));
 
       const cookies = getCookies(res);
       expect(cookies.length).toBe(1);
@@ -100,8 +195,62 @@ describe('createSSOHandler', () => {
 
       expect(res.status).toBe(400);
       expect(res.headers.get('Content-Type')).toBe('image/gif');
-      // Should NOT set any cookies
       expect(getCookies(res).length).toBe(0);
+    });
+
+    it('handles remove action in payload', async () => {
+      const payload: SSOCookiePayloadItem[] = [
+        { name: 'userId', value: '', action: 'remove' },
+        { name: 'sessionExpiration', value: '', action: 'remove' },
+      ];
+      const token = await encryptPayload(payload, TEST_ENCRYPTION_KEY);
+      const { GET } = createSSOHandler(multiCookieConfig);
+      const res = await GET(makeRequest({ action: 'login', token }));
+
+      expect(res.status).toBe(200);
+      const cookies = getCookies(res);
+      expect(cookies.length).toBe(2);
+      for (const cookie of cookies) {
+        expect(cookie).toContain('Max-Age=0');
+      }
+    });
+
+    it('returns 400 when encryption key is wrong', async () => {
+      const payload: SSOCookiePayloadItem[] = [
+        { name: 'userId', value: 'abc', action: 'set' },
+      ];
+      const token = await encryptPayload(payload, 'wrong-key-that-does-not-match');
+      const { GET } = createSSOHandler(multiCookieConfig);
+      const res = await GET(makeRequest({ action: 'login', token }));
+
+      expect(res.status).toBe(400);
+      expect(getCookies(res).length).toBe(0);
+    });
+
+    it('returns 400 when token is corrupted', async () => {
+      const { GET } = createSSOHandler(minimalConfig);
+      const res = await GET(makeRequest({ action: 'login', token: 'not-valid-base64-!!!' }));
+
+      expect(res.status).toBe(400);
+      expect(getCookies(res).length).toBe(0);
+    });
+
+    it('uses default security options for cookies not in login config', async () => {
+      const payload: SSOCookiePayloadItem[] = [
+        { name: 'unknownCookie', value: 'some-value', action: 'set' },
+      ];
+      const token = await encryptPayload(payload, TEST_ENCRYPTION_KEY);
+      const { GET } = createSSOHandler(minimalConfig);
+      const res = await GET(makeRequest({ action: 'login', token }));
+
+      expect(res.status).toBe(200);
+      const cookies = getCookies(res);
+      expect(cookies.length).toBe(1);
+      expect(cookies[0]).toContain('unknownCookie=some-value');
+      expect(cookies[0]).toContain('HttpOnly');
+      expect(cookies[0]).toContain('Secure');
+      expect(cookies[0]).toContain('SameSite=Lax');
+      expect(cookies[0]).toContain('Path=/');
     });
   });
 
@@ -248,8 +397,12 @@ describe('createSSOHandler', () => {
     it('calls onComplete with action and request on login', async () => {
       const onComplete = jest.fn();
       const config: SSOConfig = { ...minimalConfig, onComplete };
+      const payload: SSOCookiePayloadItem[] = [
+        { name: 'token', value: 'abc', action: 'set' },
+      ];
+      const token = await encryptPayload(payload, TEST_ENCRYPTION_KEY);
       const { GET } = createSSOHandler(config);
-      const req = makeRequest({ action: 'login', token: 'abc' });
+      const req = makeRequest({ action: 'login', token });
       await GET(req);
 
       expect(onComplete).toHaveBeenCalledTimes(1);
@@ -277,16 +430,84 @@ describe('createSSOHandler', () => {
     });
   });
 
-  describe('URL-encoded values', () => {
-    it('handles special characters in the token', async () => {
-      const { GET } = createSSOHandler(minimalConfig);
-      const res = await GET(makeRequest({ action: 'login', token: 'a=b&c=d' }));
+  describe('AES-256-ECB mode', () => {
+    const ecbConfig: SSOConfig = {
+      cookies: {
+        login: [
+          { name: 'userId', httpOnly: true, secure: true, path: '/', domain: '.example.com' },
+          { name: 'session', httpOnly: false, secure: true, path: '/' },
+        ],
+        logout: ['userId', 'session'],
+      },
+      encryptionKey: TEST_ENCRYPTION_KEY,
+      encryptionAlgorithm: 'aes-256-ecb',
+    };
+
+    it('decrypts ECB payload and sets cookies', async () => {
+      const payload: SSOCookiePayloadItem[] = [
+        { name: 'userId', value: 'user-42', action: 'set' },
+        { name: 'session', value: '2026-12-31T00:00:00.000Z', action: 'set' },
+      ];
+      const token = await encryptPayloadECB(payload, TEST_ENCRYPTION_KEY);
+      const { GET } = createSSOHandler(ecbConfig);
+      const res = await GET(makeRequest({ action: 'login', token }));
+
+      expect(res.status).toBe(200);
+      const cookies = getCookies(res);
+      expect(cookies.length).toBe(2);
+      expect(cookies[0]).toContain('userId=user-42');
+      expect(cookies[0]).toContain('HttpOnly');
+      expect(cookies[0]).toContain('Domain=.example.com');
+      expect(cookies[1]).toContain('session=');
+      expect(cookies[1]).toContain('2026-12-31');
+      expect(cookies[1]).not.toContain('HttpOnly');
+    });
+
+    it('handles remove action in ECB payload', async () => {
+      const payload: SSOCookiePayloadItem[] = [
+        { name: 'userId', value: '', action: 'remove' },
+      ];
+      const token = await encryptPayloadECB(payload, TEST_ENCRYPTION_KEY);
+      const { GET } = createSSOHandler(ecbConfig);
+      const res = await GET(makeRequest({ action: 'login', token }));
 
       expect(res.status).toBe(200);
       const cookies = getCookies(res);
       expect(cookies.length).toBe(1);
-      // The token should be URL-encoded in the cookie value
-      expect(cookies[0]).toContain('token=a%3Db%26c%3Dd');
+      expect(cookies[0]).toContain('Max-Age=0');
+    });
+
+    it('returns 400 when ECB key is wrong', async () => {
+      const payload: SSOCookiePayloadItem[] = [
+        { name: 'userId', value: 'abc', action: 'set' },
+      ];
+      const token = await encryptPayloadECB(payload, 'wrong-key-not-matching');
+      const { GET } = createSSOHandler(ecbConfig);
+      const res = await GET(makeRequest({ action: 'login', token }));
+
+      expect(res.status).toBe(400);
+      expect(getCookies(res).length).toBe(0);
+    });
+
+    it('returns 400 when ECB token is corrupted', async () => {
+      const { GET } = createSSOHandler(ecbConfig);
+      const res = await GET(makeRequest({ action: 'login', token: 'corrupted!!!' }));
+
+      expect(res.status).toBe(400);
+      expect(getCookies(res).length).toBe(0);
+    });
+
+    it('logout works in ECB mode', async () => {
+      const { GET } = createSSOHandler(ecbConfig);
+      const res = await GET(makeRequest({ action: 'logout' }));
+
+      expect(res.status).toBe(200);
+      const cookies = getCookies(res);
+      expect(cookies.length).toBe(2);
+      for (const cookie of cookies) {
+        expect(cookie).toContain('Max-Age=0');
+      }
     });
   });
+
 });
