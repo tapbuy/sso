@@ -1,7 +1,7 @@
 {
   "name": "@tapbuy-public/sso",
   "version": "1.0.0",
-  "description": "Framework-agnostic SSO handler for Tapbuy checkout — sets auth cookies from a token passed via query param",
+  "description": "Framework-agnostic SSO handler for Tapbuy checkout — decrypts an encrypted token from a query param and sets/deletes auth cookies accordingly",
   "main": "dist/index.js",
   "module": "dist/esm/index.js",
   "types": "dist/index.d.ts",
