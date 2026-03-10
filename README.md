@@ -104,7 +104,7 @@ The `GET` handler reads two query parameters from the request URL:
 
 ```typescript
 interface SSOCookiePayloadItem {
-  name: string;           // Cookie name (must match a name in cookies.login)
+  name: string;           // Cookie name
   value: string;          // Cookie value to set
   action: 'set' | 'remove'; // Whether to set or remove (expire) this cookie
 }

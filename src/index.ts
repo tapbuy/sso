@@ -163,8 +163,23 @@ function serializeCookie(
 function matchesOrigin(origin: string, allowed: (string | RegExp)[]): boolean {
   return allowed.some((pattern) => {
     if (typeof pattern === 'string') return origin === pattern;
+    pattern.lastIndex = 0;
     return pattern.test(origin);
   });
+}
+
+const VALID_ACTIONS = new Set(['set', 'remove']);
+
+function isValidPayload(payload: unknown): payload is SSOCookiePayloadItem[] {
+  if (!Array.isArray(payload)) return false;
+  return payload.every(
+    (item) =>
+      item != null &&
+      typeof item === 'object' &&
+      typeof item.name === 'string' &&
+      typeof item.value === 'string' &&
+      VALID_ACTIONS.has(item.action),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -339,9 +354,14 @@ export function createSSOHandler(config: SSOConfig): {
         const decrypt = encryptionAlgorithm === 'aes-256-ecb' ? decryptPayloadECB : decryptPayload;
         const payload = await decrypt(token, encryptionKey);
 
+        if (!isValidPayload(payload)) {
+          return new Response(TRANSPARENT_GIF, { status: 400, headers });
+        }
+
         for (const item of payload) {
-          // Find matching cookie config for security options (httpOnly, secure, etc.)
+          // Only allow cookies explicitly listed in config.cookies.login
           const cookieCfg = cookies.login.find((c) => c.name === item.name);
+          if (!cookieCfg) continue;
 
           if (item.action === 'set') {
             const serialized = serializeCookie(item.name, item.value, {

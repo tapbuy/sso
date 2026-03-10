@@ -237,7 +237,7 @@ describe('createSSOHandler', () => {
       expect(getCookies(res).length).toBe(0);
     });
 
-    it('uses default security options for cookies not in login config', async () => {
+    it('silently ignores cookies not in login config (allow-list)', async () => {
       const payload: SSOCookiePayloadItem[] = [
         { name: 'unknownCookie', value: 'some-value', action: 'set' },
       ];
@@ -247,12 +247,86 @@ describe('createSSOHandler', () => {
 
       expect(res.status).toBe(200);
       const cookies = getCookies(res);
+      expect(cookies.length).toBe(0);
+    });
+
+    it('returns 400 when payload item has invalid action', async () => {
+      const payload = [
+        { name: 'token', value: 'abc', action: 'update' },
+      ];
+      const token = await encryptPayload(payload as SSOCookiePayloadItem[], TEST_ENCRYPTION_KEY);
+      const { GET } = createSSOHandler(minimalConfig);
+      const res = await GET(makeRequest({ action: 'login', token }));
+
+      expect(res.status).toBe(400);
+      expect(getCookies(res).length).toBe(0);
+    });
+
+    it('returns 400 when payload item is missing name', async () => {
+      const payload = [
+        { value: 'abc', action: 'set' },
+      ];
+      const token = await encryptPayload(payload as unknown as SSOCookiePayloadItem[], TEST_ENCRYPTION_KEY);
+      const { GET } = createSSOHandler(minimalConfig);
+      const res = await GET(makeRequest({ action: 'login', token }));
+
+      expect(res.status).toBe(400);
+      expect(getCookies(res).length).toBe(0);
+    });
+
+    it('returns 400 when payload item is missing value', async () => {
+      const payload = [
+        { name: 'token', action: 'set' },
+      ];
+      const token = await encryptPayload(payload as unknown as SSOCookiePayloadItem[], TEST_ENCRYPTION_KEY);
+      const { GET } = createSSOHandler(minimalConfig);
+      const res = await GET(makeRequest({ action: 'login', token }));
+
+      expect(res.status).toBe(400);
+      expect(getCookies(res).length).toBe(0);
+    });
+
+    it('returns 400 when payload is not an array', async () => {
+      const encoder = new TextEncoder();
+      // Manually encrypt a non-array JSON payload
+      const keyBytes = new Uint8Array(32);
+      const rawKey = encoder.encode(TEST_ENCRYPTION_KEY);
+      keyBytes.set(rawKey.subarray(0, 32));
+      const cryptoKey = await globalThis.crypto.subtle.importKey('raw', keyBytes, { name: 'AES-GCM' }, false, ['encrypt']);
+      const iv = globalThis.crypto.getRandomValues(new Uint8Array(12));
+      const plaintext = encoder.encode(JSON.stringify({ name: 'token', value: 'abc', action: 'set' }));
+      const encrypted = await globalThis.crypto.subtle.encrypt({ name: 'AES-GCM', iv, tagLength: 128 }, cryptoKey, plaintext);
+      const encryptedBytes = new Uint8Array(encrypted);
+      const cipherText = encryptedBytes.slice(0, encryptedBytes.length - 16);
+      const tag = encryptedBytes.slice(encryptedBytes.length - 16);
+      const result = new Uint8Array(iv.length + tag.length + cipherText.length);
+      result.set(iv, 0);
+      result.set(tag, 12);
+      result.set(cipherText, 28);
+      let binary = '';
+      for (let i = 0; i < result.length; i++) binary += String.fromCharCode(result[i]);
+      const token = btoa(binary);
+
+      const { GET } = createSSOHandler(minimalConfig);
+      const res = await GET(makeRequest({ action: 'login', token }));
+
+      expect(res.status).toBe(400);
+      expect(getCookies(res).length).toBe(0);
+    });
+
+    it('sets allowed cookies and ignores unknown ones in mixed payload', async () => {
+      const payload: SSOCookiePayloadItem[] = [
+        { name: 'token', value: 'valid', action: 'set' },
+        { name: 'evil', value: 'injected', action: 'set' },
+      ];
+      const token = await encryptPayload(payload, TEST_ENCRYPTION_KEY);
+      const { GET } = createSSOHandler(minimalConfig);
+      const res = await GET(makeRequest({ action: 'login', token }));
+
+      expect(res.status).toBe(200);
+      const cookies = getCookies(res);
       expect(cookies.length).toBe(1);
-      expect(cookies[0]).toContain('unknownCookie=some-value');
-      expect(cookies[0]).toContain('HttpOnly');
-      expect(cookies[0]).toContain('Secure');
-      expect(cookies[0]).toContain('SameSite=Lax');
-      expect(cookies[0]).toContain('Path=/');
+      expect(cookies[0]).toContain('token=valid');
     });
   });
 
