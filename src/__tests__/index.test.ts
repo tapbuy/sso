@@ -22,7 +22,9 @@ function getCookies(response: Response): string[] {
   if (!raw) return [];
   // Multiple Set-Cookie headers are joined by the runtime with ", " in some
   // implementations, but `Headers.getSetCookie()` is the standard way.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   if (typeof (response.headers as any).getSetCookie === 'function') {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     return (response.headers as any).getSetCookie();
   }
   return raw.split(/,(?=\s*[A-Za-z0-9_-]+=)/).map((s) => s.trim());
