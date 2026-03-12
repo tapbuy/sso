@@ -208,8 +208,8 @@ async function decryptPayload(
   const rawKey = encoder.encode(encryptionKey);
   keyBytes.set(rawKey.subarray(0, 32));
 
-  // Decode base64
-  const binaryStr = atob(encryptedBase64);
+  // Decode base64 — some environments convert '+' to ' ' in URL params, restore it
+  const binaryStr = atob(encryptedBase64.replace(/ /g, '+'));
   const data = new Uint8Array(binaryStr.length);
   for (let i = 0; i < binaryStr.length; i++) {
     data[i] = binaryStr.charCodeAt(i);
@@ -268,8 +268,8 @@ async function decryptPayloadECB(
   const rawKey = encoder.encode(encryptionKey);
   keyBytes.set(rawKey.subarray(0, 32));
 
-  // Decode base64
-  const binaryStr = atob(encryptedBase64);
+  // Decode base64 — some environments convert '+' to ' ' in URL params, restore it
+  const binaryStr = atob(encryptedBase64.replace(/ /g, '+'));
   const data = new Uint8Array(binaryStr.length);
   for (let i = 0; i < binaryStr.length; i++) {
     data[i] = binaryStr.charCodeAt(i);
