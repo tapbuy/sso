@@ -1,4 +1,4 @@
-import { createSSOHandler, SSOConfig, SSOCookiePayloadItem } from '../index';
+import createSSOHandlerDefault, { createSSOHandler, SSOConfig, SSOCookiePayloadItem } from '../index';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -328,6 +328,28 @@ describe('createSSOHandler', () => {
       expect(cookies.length).toBe(1);
       expect(cookies[0]).toContain('token=valid');
     });
+
+    it('decrypts token where + was converted to spaces by URL parsing', async () => {
+      const payload: SSOCookiePayloadItem[] = [
+        { name: 'token', value: 'some-value', action: 'set' },
+      ];
+      const token = await encryptPayload(payload, TEST_ENCRYPTION_KEY);
+
+      // Simulate what happens when '+' in base64 gets converted to ' '
+      // (e.g. Cloudflare or URLSearchParams treating '+' as space)
+      const tokenWithSpaces = token.replace(/\+/g, ' ');
+
+      const url = `https://checkout.example.com/api/tapbuy-sso?action=login&token=${encodeURIComponent(tokenWithSpaces)}`;
+      const request = new Request(url);
+
+      const { GET } = createSSOHandler(minimalConfig);
+      const res = await GET(request);
+
+      expect(res.status).toBe(200);
+      const cookies = getCookies(res);
+      expect(cookies.length).toBe(1);
+      expect(cookies[0]).toContain('token=some-value');
+    });
   });
 
   describe('logout action', () => {
@@ -583,6 +605,159 @@ describe('createSSOHandler', () => {
       for (const cookie of cookies) {
         expect(cookie).toContain('Max-Age=0');
       }
+    });
+  });
+
+  describe('empty payload', () => {
+    it('returns 200 with no cookies when payload is an empty array', async () => {
+      const payload: SSOCookiePayloadItem[] = [];
+      const token = await encryptPayload(payload, TEST_ENCRYPTION_KEY);
+      const { GET } = createSSOHandler(minimalConfig);
+      const res = await GET(makeRequest({ action: 'login', token }));
+
+      expect(res.status).toBe(200);
+      expect(getCookies(res).length).toBe(0);
+    });
+  });
+
+  describe('onComplete edge cases', () => {
+    it('does not call onComplete on decryption failure', async () => {
+      const onComplete = jest.fn();
+      const config: SSOConfig = { ...minimalConfig, onComplete };
+      const payload: SSOCookiePayloadItem[] = [
+        { name: 'token', value: 'abc', action: 'set' },
+      ];
+      const token = await encryptPayload(payload, 'wrong-key-wrong-key-wrong-key!!');
+      const { GET } = createSSOHandler(config);
+      await GET(makeRequest({ action: 'login', token }));
+
+      expect(onComplete).not.toHaveBeenCalled();
+    });
+
+    it('awaits async onComplete before returning', async () => {
+      let sideEffectDone = false;
+      const onComplete = jest.fn(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        sideEffectDone = true;
+      });
+      const config: SSOConfig = { ...minimalConfig, onComplete };
+      const { GET } = createSSOHandler(config);
+      const res = await GET(makeRequest({ action: 'logout' }));
+
+      expect(res.status).toBe(200);
+      expect(onComplete).toHaveBeenCalledTimes(1);
+      expect(sideEffectDone).toBe(true);
+    });
+  });
+
+  describe('logout cookie not in login config', () => {
+    it('uses default options when logout cookie has no matching login config', async () => {
+      const config: SSOConfig = {
+        cookies: {
+          login: [{ name: 'token' }],
+          logout: ['token', 'orphanCookie'],
+        },
+        encryptionKey: TEST_ENCRYPTION_KEY,
+      };
+      const { GET } = createSSOHandler(config);
+      const res = await GET(makeRequest({ action: 'logout' }));
+
+      expect(res.status).toBe(200);
+      const cookies = getCookies(res);
+      expect(cookies.length).toBe(2);
+
+      // orphanCookie should use defaults (HttpOnly, Secure, Lax, Path=/)
+      const orphan = cookies.find((c) => c.includes('orphanCookie='));
+      expect(orphan).toBeDefined();
+      expect(orphan).toContain('Max-Age=0');
+      expect(orphan).toContain('HttpOnly');
+      expect(orphan).toContain('Secure');
+      expect(orphan).toContain('SameSite=Lax');
+      expect(orphan).toContain('Path=/');
+    });
+  });
+
+  describe('CORS on error responses', () => {
+    it('includes CORS headers on 400 error responses when origin matches', async () => {
+      const config: SSOConfig = {
+        ...minimalConfig,
+        allowedOrigins: ['https://checkout.example.com'],
+      };
+      const { GET } = createSSOHandler(config);
+      const res = await GET(
+        makeRequest({ action: 'invalid' }, { Origin: 'https://checkout.example.com' }),
+      );
+
+      expect(res.status).toBe(400);
+      expect(res.headers.get('Access-Control-Allow-Origin')).toBe(
+        'https://checkout.example.com',
+      );
+      expect(res.headers.get('Access-Control-Allow-Credentials')).toBe('true');
+    });
+
+    it('includes CORS headers on 400 when token is missing', async () => {
+      const config: SSOConfig = {
+        ...minimalConfig,
+        allowedOrigins: ['https://checkout.example.com'],
+      };
+      const { GET } = createSSOHandler(config);
+      const res = await GET(
+        makeRequest({ action: 'login' }, { Origin: 'https://checkout.example.com' }),
+      );
+
+      expect(res.status).toBe(400);
+      expect(res.headers.get('Access-Control-Allow-Origin')).toBe(
+        'https://checkout.example.com',
+      );
+    });
+  });
+
+  describe('cookie value encoding', () => {
+    it('encodes special characters in cookie values', async () => {
+      const payload: SSOCookiePayloadItem[] = [
+        { name: 'token', value: 'value with spaces;and=special&chars', action: 'set' },
+      ];
+      const token = await encryptPayload(payload, TEST_ENCRYPTION_KEY);
+      const { GET } = createSSOHandler(minimalConfig);
+      const res = await GET(makeRequest({ action: 'login', token }));
+
+      expect(res.status).toBe(200);
+      const cookies = getCookies(res);
+      expect(cookies.length).toBe(1);
+      // encodeURIComponent encodes spaces, semicolons, equals signs
+      expect(cookies[0]).toContain(encodeURIComponent('value with spaces;and=special&chars'));
+      expect(cookies[0]).not.toContain('value with spaces');
+    });
+  });
+
+  describe('matchesOrigin with global RegExp', () => {
+    it('handles global RegExp correctly across multiple requests', async () => {
+      const config: SSOConfig = {
+        ...minimalConfig,
+        allowedOrigins: [/\.example\.com$/g],
+      };
+      const { GET } = createSSOHandler(config);
+
+      // Call twice — global regex could fail on second call if lastIndex not reset
+      const res1 = await GET(
+        makeRequest({ action: 'logout' }, { Origin: 'https://checkout.example.com' }),
+      );
+      const res2 = await GET(
+        makeRequest({ action: 'logout' }, { Origin: 'https://checkout.example.com' }),
+      );
+
+      expect(res1.headers.get('Access-Control-Allow-Origin')).toBe(
+        'https://checkout.example.com',
+      );
+      expect(res2.headers.get('Access-Control-Allow-Origin')).toBe(
+        'https://checkout.example.com',
+      );
+    });
+  });
+
+  describe('default export', () => {
+    it('exports createSSOHandler as default', () => {
+      expect(createSSOHandlerDefault).toBe(createSSOHandler);
     });
   });
 
