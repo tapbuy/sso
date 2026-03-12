@@ -355,6 +355,7 @@ export function createSSOHandler(config: SSOConfig): {
         const payload = await decrypt(token, encryptionKey);
 
         if (!isValidPayload(payload)) {
+          console.error('[tapbuy-sso] Invalid payload structure after decryption:', JSON.stringify(payload));
           return new Response(TRANSPARENT_GIF, { status: 400, headers });
         }
 
@@ -385,9 +386,13 @@ export function createSSOHandler(config: SSOConfig): {
             headers.append('Set-Cookie', serialized);
           }
         }
-      } catch {
-        // Decryption or JSON parse failed — bad token
-        return new Response(TRANSPARENT_GIF, { status: 400, headers });
+      } catch (err) {
+        console.error('[tapbuy-sso] Decryption failed:', err);
+        const isConfigError =
+          err instanceof Error &&
+          /crypto|webcrypto|subtle/i.test(err.message || '');
+        const status = isConfigError ? 500 : 400;
+        return new Response(TRANSPARENT_GIF, { status, headers });
       }
     }
 
