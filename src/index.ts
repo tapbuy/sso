@@ -388,7 +388,11 @@ export function createSSOHandler(config: SSOConfig): {
         }
       } catch (err) {
         console.error('[tapbuy-sso] Decryption failed:', err instanceof Error ? err.message : err);
-        return new Response(TRANSPARENT_GIF, { status: 400, headers });
+        const isConfigError =
+          err instanceof Error &&
+          /crypto|webcrypto|subtle/i.test(err.message || '');
+        const status = isConfigError ? 500 : 400;
+        return new Response(TRANSPARENT_GIF, { status, headers });
       }
     }
 
